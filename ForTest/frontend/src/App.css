@@ -179,6 +179,43 @@
   overflow-y: auto;
 }
 
+.page-controls {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 10px;
+  background: #f8f9fa;
+  padding: 8px;
+  border-radius: 4px;
+}
+
+.page-nav {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.page-info {
+  font-weight: 500;
+  font-size: 14px;
+}
+
+.page-settings {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.setting-label {
+  font-size: 13px;
+  color: #666;
+}
+
+.count-input {
+  width: 60px !important;
+  text-align: center;
+}
+
 .image-wrapper {
   position: relative;
 }
@@ -473,11 +510,47 @@
   color: #333;
 }
 
+.current-topic-badge {
+  background: #e8f5e9;
+  border: 2px solid #4caf50;
+  border-radius: 8px;
+  padding: 0.5rem 0.75rem;
+  margin-bottom: 0.75rem;
+  font-size: 0.85rem;
+  color: #2e7d32;
+  font-weight: 500;
+  word-wrap: break-word;
+  overflow-wrap: break-word;
+  animation: fadeIn 0.3s ease-in;
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(-5px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
 .topic-dropdown {
   font-size: 0.85rem;  /* 减小字体 */
   margin-bottom: 0.75rem;
   border: 2px solid #333;
   border-radius: 8px;
+  width: 100%;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.topic-dropdown option {
+  white-space: normal;
+  word-wrap: break-word;
+  padding: 0.5rem;
 }
 
 .add-topic-btn {

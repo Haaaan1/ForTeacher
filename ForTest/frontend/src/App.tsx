@@ -3,7 +3,7 @@ import axios from 'axios';
 import ReactCrop, { Crop } from 'react-image-crop';
 import { PixelCrop } from 'react-image-crop';
 import 'react-image-crop/dist/ReactCrop.css';
-import { Button, Form, ListGroup, Modal } from 'react-bootstrap';
+import { Button, Form, ListGroup, Modal, Toast, ToastContainer } from 'react-bootstrap';
 import './App.css';
 
 const API_URL = '/api';
@@ -36,15 +36,81 @@ function App() {
   const [pages, setPages] = useState<Page[]>([]);
   const [questions, setQuestions] = useState<Question[]>([]);
   const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0);
+  const [currentViewPageNum, setCurrentViewPageNum] = useState(1);
   const [crop, setCrop] = useState<Crop>();
   const [completedCrop, setCompletedCrop] = useState<PixelCrop>();
   const [showTopicModal, setShowTopicModal] = useState(false);
   const [newTopic, setNewTopic] = useState('');
   const [uploadProgress, setUploadProgress] = useState(0);
   const [uploadStatus, setUploadStatus] = useState('');
+  const [pageQuestionCounts, setPageQuestionCounts] = useState<Record<number, number>>({});
+  const [showSuccessToast, setShowSuccessToast] = useState(false);
+  const [successToastMessage, setSuccessToastMessage] = useState('');
 
   const imgRef = useRef<HTMLImageElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+
+  const loadImage = (src: string): Promise<HTMLImageElement> => {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = () => reject(new Error('图片加载失败'));
+      img.src = src;
+    });
+  };
+
+  const cropQuestionFromBoundingBox = async (question: Question): Promise<string | undefined> => {
+    const page = pages.find(p => p.page_num === question.page_num);
+    if (!page) return undefined;
+
+    try {
+      const image = await loadImage(page.image);
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return undefined;
+
+      const scaleX = image.naturalWidth / page.width;
+      const scaleY = image.naturalHeight / page.height;
+
+      const x = Math.max(0, Math.floor(question.bounding_box.x * scaleX));
+      const y = Math.max(0, Math.floor(question.bounding_box.y * scaleY));
+      const width = Math.max(1, Math.floor(question.bounding_box.width * scaleX));
+      const height = Math.max(1, Math.floor(question.bounding_box.height * scaleY));
+
+      const safeWidth = Math.min(width, image.naturalWidth - x);
+      const safeHeight = Math.min(height, image.naturalHeight - y);
+      if (safeWidth <= 0 || safeHeight <= 0) return undefined;
+
+      canvas.width = safeWidth;
+      canvas.height = safeHeight;
+      ctx.drawImage(image, x, y, safeWidth, safeHeight, 0, 0, safeWidth, safeHeight);
+      return canvas.toDataURL('image/png');
+    } catch (error) {
+      console.error('Failed to crop by bounding box:', error);
+      return undefined;
+    }
+  };
+
+  const buildQuestionsForPdf = async (): Promise<Question[]> => {
+    const baseQuestions = questions.map(q => ({ ...q }));
+    const canvas = canvasRef.current;
+
+    // 关键逻辑：优先保存当前题目正在编辑的裁剪结果，避免最后一题丢失
+    if (canvas && canvas.width > 0 && canvas.height > 0 && currentQuestionIndex >= 0 && baseQuestions[currentQuestionIndex]) {
+      baseQuestions[currentQuestionIndex].crop_image = canvas.toDataURL('image/png');
+    }
+
+    const finalizedQuestions = await Promise.all(
+      baseQuestions.map(async (q) => {
+        if (q.crop_image) return q;
+        const fallbackCrop = await cropQuestionFromBoundingBox(q);
+        if (!fallbackCrop) return q;
+        return { ...q, crop_image: fallbackCrop };
+      })
+    );
+
+    return finalizedQuestions;
+  };
 
   // 加载默认 Topics
   useEffect(() => {
@@ -114,10 +180,17 @@ function App() {
         });
 
         setPages(response.data.pages);
-        setUploadStatus('');
+        setCurrentViewPageNum(1);
+
+        // 立即重置进度条和状态，避免卡顿感
+        setUploadProgress(0);
+        setUploadStatus('正在处理题目...');
 
         // 自动检测题目
         await detectQuestions(response.data.pages);
+
+        // 清除状态
+        setUploadStatus('');
       } catch (error: any) {
         console.error('Upload failed:', error);
         setUploadProgress(0);
@@ -139,18 +212,74 @@ function App() {
   };
 
   // 检测题目
-  const detectQuestions = async (pagesData: Page[]) => {
+  const detectQuestions = async (pagesData: Page[], customCounts: Record<number, number> = {}) => {
     try {
       const response = await axios.post(`${API_URL}/detect-questions`, {
-        pages: pagesData
+        pages: pagesData,
+        page_question_counts: customCounts
       });
 
-      setQuestions(response.data.questions);
-      setCurrentQuestionIndex(0);
+      const newQuestions = response.data.questions as Question[];
 
-      // 设置初始 crop
-      if (response.data.questions[0]) {
+      // 智能合并策略：保留未变更页面的 Topic 和裁剪信息
+      // 1. 找出哪些页面的题目数发生了变化（或者这是第一次检测）
+      // 2. 对于没变化的页面，尝试保留原有的题目数据
+      
+      setQuestions(prevQuestions => {
+        if (prevQuestions.length === 0) return newQuestions;
+
+        // 建立旧题目的索引：page_num -> questions
+        const oldQuestionsByPage: Record<number, Question[]> = {};
+        prevQuestions.forEach(q => {
+          if (!oldQuestionsByPage[q.page_num]) {
+            oldQuestionsByPage[q.page_num] = [];
+          }
+          oldQuestionsByPage[q.page_num].push(q);
+        });
+
+        // 遍历新题目，尝试从旧题目中恢复状态
+        return newQuestions.map(newQ => {
+          const oldPageQuestions = oldQuestionsByPage[newQ.page_num];
+          
+          // 如果该页曾经有题目，且题目数量一致（说明没改动数量），则尝试按顺序恢复 topic 和 crop_image
+          // 注意：如果用户修改了题目数，这页的题目 ID 可能会变，或者数量变了，这时候就用新的（重置状态）
+          // eslint-disable-next-line @typescript-eslint/no-unused-vars
+          const customCount = customCounts[newQ.page_num];
+          
+          // 逻辑：如果该页不在 customCounts 里（说明是默认），或者数量没变... 
+          // 简化逻辑：只要该页的旧题目数量 == 新题目数量，就认为可以继承
+          if (oldPageQuestions && oldPageQuestions.length > 0) {
+             // 找到当前新题目在该页是第几个
+             const indexInPage = newQuestions.filter(q => q.page_num === newQ.page_num && q.number < newQ.number).length;
+             
+             if (indexInPage < oldPageQuestions.length) {
+                // 对应旧题目
+                const oldQ = oldPageQuestions[indexInPage];
+                // 如果题目数量没变（比较该页总数），则继承
+                const newPageCount = newQuestions.filter(q => q.page_num === newQ.page_num).length;
+                if (oldPageQuestions.length === newPageCount) {
+                  return {
+                    ...newQ,
+                    topic: oldQ.topic,
+                    crop_image: oldQ.crop_image
+                  };
+                }
+             }
+          }
+          return newQ;
+        });
+      });
+
+      // 如果是第一次加载（currentIndex=0），或者重置后索引越界，修正索引
+      setCurrentQuestionIndex(prev => {
+         if (prev >= response.data.questions.length) return 0;
+         return prev;
+      });
+
+      // 设置初始 crop (如果是首次)
+      if (questions.length === 0 && response.data.questions[0]) {
         const q = response.data.questions[0];
+        setCurrentViewPageNum(q.page_num);
         setCrop({
           unit: '%',
           x: 0,
@@ -165,8 +294,50 @@ function App() {
     }
   };
 
+  // 处理单页重新识别
+  const handleRescanPage = async (pageNum: number, count: number) => {
+    // 1. 保存当前进度（裁剪图等）
+    await saveCroppedImage();
+
+    // 2. 更新配置
+    const newCounts = { ...pageQuestionCounts, [pageNum]: count };
+    setPageQuestionCounts(newCounts);
+
+    // 3. 重新检测
+    // 注意：detectQuestions 会处理合并逻辑
+    await detectQuestions(pages, newCounts);
+    
+    alert(`第 ${pageNum} 页已按 ${count} 题重新识别`);
+  };
+
+  // 页面导航
+  const handlePrevPage = async () => {
+    const prevPageNum = currentViewPageNum - 1;
+    if (prevPageNum < 1) return;
+    
+    jumpToPage(prevPageNum);
+  };
+
+  const handleNextPage = async () => {
+    const nextPageNum = currentViewPageNum + 1;
+    if (nextPageNum > pages.length) return;
+    
+    jumpToPage(nextPageNum);
+  };
+
+  const jumpToPage = async (pageNum: number) => {
+    // 先保存当前
+    await saveCroppedImage();
+    // 关键逻辑：翻页只切换页面，不切换题号
+    setCurrentViewPageNum(pageNum);
+  };
+
+
   // 选择 Topic
-  const handleTopicSelect = (topic: string) => {
+  const handleTopicSelect = async (topic: string) => {
+    // 先保存当前裁剪
+    await saveCroppedImage();
+
     const updatedQuestions = [...questions];
     updatedQuestions[currentQuestionIndex].topic = topic;
     setQuestions(updatedQuestions);
@@ -186,18 +357,28 @@ function App() {
   };
 
   // 上一题
-  const handlePrevQuestion = () => {
+  const handlePrevQuestion = async () => {
     if (currentQuestionIndex > 0) {
-      setCurrentQuestionIndex(currentQuestionIndex - 1);
-      updateCropForQuestion(currentQuestionIndex - 1);
+      // 先保存当前题目的裁剪
+      await saveCroppedImage();
+
+      const nextIndex = currentQuestionIndex - 1;
+      setCurrentQuestionIndex(nextIndex);
+      setCurrentViewPageNum(questions[nextIndex].page_num);
+      updateCropForQuestion(nextIndex);
     }
   };
 
   // 下一题
-  const handleNextQuestion = () => {
+  const handleNextQuestion = async () => {
     if (currentQuestionIndex < questions.length - 1) {
-      setCurrentQuestionIndex(currentQuestionIndex + 1);
-      updateCropForQuestion(currentQuestionIndex + 1);
+      // 先保存当前题目的裁剪
+      await saveCroppedImage();
+
+      const nextIndex = currentQuestionIndex + 1;
+      setCurrentQuestionIndex(nextIndex);
+      setCurrentViewPageNum(questions[nextIndex].page_num);
+      updateCropForQuestion(nextIndex);
     }
   };
 
@@ -219,16 +400,12 @@ function App() {
   // 生成 PDF（修复版）
   const handleGeneratePdf = async () => {
     try {
-      // 收集所有裁剪后的图片
-      const updatedQuestions = [...questions].map(q => {
-        // 如果有 crop_image 则使用，已经处理好了
-        return q;
-      });
-
-      console.log('Generating PDF with questions:', updatedQuestions.length);
+      const questionsForPdf = await buildQuestionsForPdf();
+      setQuestions(questionsForPdf);
+      console.log('Generating PDF with questions:', questionsForPdf.length);
 
       const response = await axios.post(`${API_URL}/generate-pdf`, {
-        questions: updatedQuestions
+        questions: questionsForPdf
       }, {
         responseType: 'blob',
         timeout: 120000
@@ -245,7 +422,9 @@ function App() {
 
       // 清理
       window.URL.revokeObjectURL(url);
-      alert('PDF 生成成功！');
+      // 关键提示：使用内置 Toast，替代浏览器 alert
+      setSuccessToastMessage('PDF 生成成功，已开始下载');
+      setShowSuccessToast(true);
     } catch (error: any) {
       console.error('PDF generation failed:', error);
 
@@ -294,8 +473,45 @@ function App() {
     );
   }, [completedCrop]);
 
+  // 保存当前题目的裁剪图片（返回 Promise）
+  const saveCroppedImage = (): Promise<void> => {
+    return new Promise(async (resolve) => {
+      if (currentQuestionIndex < 0 || !questions[currentQuestionIndex]) {
+        resolve();
+        return;
+      }
+
+      let croppedImageData: string | undefined;
+
+      try {
+        const canvas = canvasRef.current;
+        if (canvas && canvas.width > 0 && canvas.height > 0) {
+          croppedImageData = canvas.toDataURL('image/png');
+        } else {
+          // 关键逻辑：没有手动裁剪数据时，自动按题目边界生成截图
+          croppedImageData = await cropQuestionFromBoundingBox(questions[currentQuestionIndex]);
+        }
+
+        if (croppedImageData) {
+          setQuestions(prev => {
+            const updated = [...prev];
+            updated[currentQuestionIndex] = {
+              ...updated[currentQuestionIndex],
+              crop_image: croppedImageData
+            };
+            return updated;
+          });
+        }
+      } catch (error) {
+        console.error('Failed to save cropped image:', error);
+      }
+
+      setTimeout(resolve, 50);
+    });
+  };
+
   const currentQuestion = questions[currentQuestionIndex];
-  const currentPage = pages.find(p => p.page_num === currentQuestion?.page_num);
+  const currentPage = pages.find(p => p.page_num === currentViewPageNum);
 
   // 按题目编号排序显示
   const sortedQuestions = [...questions].sort((a, b) => a.number - b.number);
@@ -357,6 +573,59 @@ function App() {
 
             <div className="crop-container">
               {currentPage && (
+                <div className="page-controls">
+                  <div className="page-nav">
+                    <Button 
+                      variant="outline-secondary" 
+                      size="sm"
+                      onClick={handlePrevPage}
+                      disabled={currentPage.page_num <= 1}
+                    >
+                      ◀ 上一页
+                    </Button>
+                    <span className="page-info">第 {currentPage.page_num} / {pages.length} 页</span>
+                    <Button 
+                      variant="outline-secondary" 
+                      size="sm"
+                      onClick={handleNextPage}
+                      disabled={currentPage.page_num >= pages.length}
+                    >
+                      下一页 ▶
+                    </Button>
+                  </div>
+                  
+                  <div className="page-settings">
+                     <span className="setting-label">当前页题目数:</span>
+                     <Form.Control
+                       type="number"
+                       min="1"
+                       max="10"
+                       size="sm"
+                       className="count-input"
+                       defaultValue={pageQuestionCounts[currentPage.page_num] || 3}
+                       key={`count-${currentPage.page_num}`} // 强制重新渲染以更新 defaultValue
+                       onBlur={(e: React.FocusEvent<HTMLInputElement>) => {
+                         const val = parseInt(e.target.value);
+                         if (val > 0 && val !== (pageQuestionCounts[currentPage.page_num] || 3)) {
+                           if (window.confirm(`确定要将第 ${currentPage.page_num} 页重新识别为 ${val} 道题吗？\n注意：这将重置该页已有的 Topic 和截图。`)) {
+                             handleRescanPage(currentPage.page_num, val);
+                           } else {
+                             // 恢复显示
+                             e.target.value = (pageQuestionCounts[currentPage.page_num] || 3).toString();
+                           }
+                         }
+                       }}
+                       onKeyDown={(e: React.KeyboardEvent<HTMLInputElement>) => {
+                         if (e.key === 'Enter') {
+                           e.currentTarget.blur();
+                         }
+                       }}
+                     />
+                  </div>
+                </div>
+              )}
+
+              {currentPage && (
                 <div className="image-wrapper">
                   <ReactCrop
                     crop={crop}
@@ -407,6 +676,11 @@ function App() {
           <div className="right-panel">
             <div className="topic-selector">
               <h3>选择 Topic</h3>
+              {currentQuestion?.topic && (
+                <div className="current-topic-badge">
+                  当前: {currentQuestion.topic}
+                </div>
+              )}
               <Form.Select
                 value={currentQuestion?.topic || ''}
                 onChange={(e) => handleTopicSelect(e.target.value)}
@@ -475,6 +749,21 @@ function App() {
           </Button>
         </Modal.Footer>
       </Modal>
+
+      <ToastContainer position="bottom-end" className="p-3">
+        <Toast
+          show={showSuccessToast}
+          onClose={() => setShowSuccessToast(false)}
+          delay={2500}
+          autohide
+          bg="success"
+        >
+          <Toast.Header closeButton>
+            <strong className="me-auto">提示</strong>
+          </Toast.Header>
+          <Toast.Body className="text-white">{successToastMessage}</Toast.Body>
+        </Toast>
+      </ToastContainer>
     </div>
   );
 }
