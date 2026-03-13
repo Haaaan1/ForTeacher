@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 import base64
+import binascii
 import io
 import os
 from PIL import Image
@@ -9,6 +10,13 @@ import re
 
 app = Flask(__name__)
 CORS(app)
+# 关键配置：限制请求体上限，避免超大文件直接压垮服务
+app.config['MAX_CONTENT_LENGTH'] = 60 * 1024 * 1024
+
+@app.errorhandler(413)
+def handle_request_entity_too_large(_):
+    # 关键逻辑：统一返回可读的文件大小错误，便于前端直接提示用户
+    return jsonify({'error': 'File too large. Max request size is 60MB.'}), 413
 
 # 默认 Topic 模板
 DEFAULT_TOPICS = [
@@ -45,17 +53,25 @@ def get_topics():
 def upload_pdf():
     """上传 PDF 并转换为图片"""
     try:
-        data = request.json
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify({'error': 'Invalid JSON body'}), 400
         pdf_base64 = data.get('pdf_base64')
 
-        if not pdf_base64:
+        if not isinstance(pdf_base64, str) or not pdf_base64.strip():
             return jsonify({'error': 'No PDF data provided'}), 400
 
         # 解码 base64
-        pdf_data = base64.b64decode(pdf_base64.split(',')[1] if ',' in pdf_base64 else pdf_base64)
+        try:
+            pdf_data = base64.b64decode(pdf_base64.split(',')[1] if ',' in pdf_base64 else pdf_base64)
+        except (ValueError, binascii.Error):
+            return jsonify({'error': 'Invalid PDF base64 data'}), 400
 
         # 打开 PDF
-        doc = fitz.open(stream=pdf_data, filetype="pdf")
+        try:
+            doc = fitz.open(stream=pdf_data, filetype="pdf")
+        except Exception:
+            return jsonify({'error': 'Invalid or corrupted PDF file'}), 400
         pages_images = []
 
         for page_num in range(len(doc)):
@@ -87,14 +103,22 @@ def upload_pdf():
 def detect_questions():
     """检测题目边界（简单规则识别）"""
     try:
-        data = request.json
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify({'error': 'Invalid JSON body'}), 400
         pages = data.get('pages', [])
         page_question_counts = data.get('page_question_counts', {})
+        if not isinstance(pages, list):
+            return jsonify({'error': 'Invalid pages payload'}), 400
+        if not isinstance(page_question_counts, dict):
+            return jsonify({'error': 'Invalid page_question_counts payload'}), 400
 
         questions = []
         question_num = 0
 
-        for page in pages:
+        for page_index, page in enumerate(pages):
+            if not isinstance(page, dict):
+                return jsonify({'error': f'Invalid page object at index {page_index}'}), 400
             # 这里需要 OCR 来识别文字
             # MVP 版本：使用简单的边界分割
             # 实际应该调用 OCR 服务
@@ -102,12 +126,18 @@ def detect_questions():
             # 关键逻辑：支持前端按页传入题目数，默认值为 3
             page_num = page.get('page_num')
             num_questions_on_page = 3
-            if isinstance(page_question_counts, dict):
-                custom_count = page_question_counts.get(str(page_num), page_question_counts.get(page_num))
-                if isinstance(custom_count, int):
-                    num_questions_on_page = max(1, min(12, custom_count))
-            height = page['height']
-            width = page['width']
+            custom_count = page_question_counts.get(str(page_num), page_question_counts.get(page_num))
+            if isinstance(custom_count, int):
+                num_questions_on_page = max(1, min(12, custom_count))
+            height = page.get('height')
+            width = page.get('width')
+            image = page.get('image')
+            if not isinstance(height, (int, float)) or height <= 0:
+                return jsonify({'error': f'Invalid page height at index {page_index}'}), 400
+            if not isinstance(width, (int, float)) or width <= 0:
+                return jsonify({'error': f'Invalid page width at index {page_index}'}), 400
+            if not isinstance(image, str) or not image.strip():
+                return jsonify({'error': f'Invalid page image at index {page_index}'}), 400
 
             for i in range(num_questions_on_page):
                 question_num += 1
@@ -117,7 +147,7 @@ def detect_questions():
                 questions.append({
                     'id': f"q{question_num}",
                     'number': question_num,
-                    'page_num': page['page_num'],
+                    'page_num': page_num,
                     'bounding_box': {
                         'x': 0,
                         'y': i * segment_height,
@@ -125,7 +155,7 @@ def detect_questions():
                         'height': segment_height
                     },
                     'topic': None,  # 待用户选择
-                    'image': page['image']  # 暂时使用整页图片
+                    'image': image  # 暂时使用整页图片
                 })
 
         return jsonify({'questions': questions})
@@ -183,8 +213,12 @@ def build_question_image_bytes(question):
 def generate_pdf():
     """生成归类后的 PDF"""
     try:
-        data = request.json
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify({'error': 'Invalid JSON body'}), 400
         questions = data.get('questions', [])
+        if not isinstance(questions, list):
+            return jsonify({'error': 'Invalid questions payload'}), 400
 
         # 创建 PDF
         doc = fitz.open()
@@ -192,6 +226,8 @@ def generate_pdf():
         # 关键逻辑：只导出已打 Topic 标签的题目
         tagged_questions = []
         for q in questions:
+            if not isinstance(q, dict):
+                continue
             topic_raw = q.get('topic')
             topic_name = topic_raw.strip() if isinstance(topic_raw, str) else ''
             if topic_name:
@@ -199,8 +235,15 @@ def generate_pdf():
                 normalized_question['topic'] = topic_name
                 tagged_questions.append(normalized_question)
 
+        def question_number_value(question):
+            value = question.get('number') if isinstance(question, dict) else None
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return 10**9
+
         # 按题号排序后再按 topic 分组
-        questions_sorted = sorted(tagged_questions, key=lambda x: x['number'])
+        questions_sorted = sorted(tagged_questions, key=question_number_value)
         grouped_questions = {}
         for q in questions_sorted:
             topic_name = q['topic']
@@ -316,7 +359,7 @@ def generate_pdf():
         for topic_name in sorted_topics:
             topic_questions = grouped_questions[topic_name]
             # 按题号排序
-            topic_questions.sort(key=lambda x: x['number'])
+            topic_questions.sort(key=question_number_value)
             
             page, cursor_y = create_topic_header(doc, topic_name)
             
@@ -324,7 +367,8 @@ def generate_pdf():
                 try:
                     # 预估当前题目所需高度
                     # 标题高度 + 图片高度 + 间距
-                    q_title = f"Q{q['number']}"  # 简化为 Q1, Q2...
+                    q_number = question_number_value(q)
+                    q_title = f"Q{q_number if q_number != 10**9 else '?'}"
                     title_height = 20
                     gap = 10
                     bottom_margin = 20
@@ -394,4 +438,6 @@ def generate_pdf():
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', debug=True, port=5001)
+    backend_port = int(os.getenv('BACKEND_PORT', '5001'))
+    debug_mode = os.getenv('FLASK_DEBUG', '1') == '1'
+    app.run(host='0.0.0.0', debug=debug_mode, port=backend_port)

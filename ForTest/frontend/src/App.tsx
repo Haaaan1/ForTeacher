@@ -6,7 +6,7 @@ import 'react-image-crop/dist/ReactCrop.css';
 import { Button, Form, ListGroup, Modal, Toast, ToastContainer } from 'react-bootstrap';
 import './App.css';
 
-const API_URL = '/api';
+const API_URL = (process.env.REACT_APP_API_BASE || '/api').replace(/\/$/, '');
 
 interface Question {
   id: string;
@@ -49,6 +49,19 @@ function App() {
 
   const imgRef = useRef<HTMLImageElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+
+  const extractApiErrorMessage = (error: any, fallbackMessage: string): string => {
+    // 关键逻辑：优先展示后端返回的 error 字段，避免只看到模糊的 Network Error
+    const backendMessage = error?.response?.data?.error;
+    if (typeof backendMessage === 'string' && backendMessage.trim()) {
+      return backendMessage;
+    }
+    const genericMessage = error?.message;
+    if (typeof genericMessage === 'string' && genericMessage.trim()) {
+      return genericMessage;
+    }
+    return fallbackMessage;
+  };
 
   const loadImage = (src: string): Promise<HTMLImageElement> => {
     return new Promise((resolve, reject) => {
@@ -200,11 +213,11 @@ function App() {
         if (error.code === 'ECONNABORTED') {
           alert('上传超时，请检查网络连接或重试');
         } else if (error.response?.status === 413) {
-          alert('文件过大，请上传更小的 PDF');
+          alert(extractApiErrorMessage(error, '文件过大，请上传更小的 PDF'));
         } else if (error.message === 'Network Error') {
           alert('网络连接失败，请检查网络设置');
         } else {
-          alert(`上传失败: ${error.message || '未知错误'}`);
+          alert(`上传失败: ${extractApiErrorMessage(error, '未知错误')}`);
         }
       }
     };
